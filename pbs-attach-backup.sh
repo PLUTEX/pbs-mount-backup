@@ -6,9 +6,12 @@ shopt -s lastpipe
 
 declare -A PBS_CONFIG=()
 
+DEFAULT_TARGET="/mnt/backup"
+DEFAULT_RAMSIZE="128"
 QEMU_DRIVE_NAME="mounted_backup"
 QEMU_DEVICE_NAME="$QEMU_DRIVE_NAME"
 QEMU_DEVICE_SERIAL="$QEMU_DRIVE_NAME"
+MOUNT_BACKUP_SCRIPT="$(dirname "$(realpath "$0")")/pbs-mount-backup.sh"
 
 debug() {
     if [ -n "${DEBUG:-}" ]; then
@@ -19,6 +22,21 @@ debug() {
 error() {
     echo "ERROR: $*" >&2
     exit 1
+}
+
+guest_exec() {
+    local QGA_EXEC_OUT
+    QGA_EXEC_OUT="$(mktemp)"
+    if ! qm guest exec -pass-stdin 1 "$VMID" -- "$@" > "$QGA_EXEC_OUT"; then
+        return 255
+    elif [ "$(jq .exited < "$QGA_EXEC_OUT")" = "1" ]; then
+        jq -r '.["out-data"] // ""' < "$QGA_EXEC_OUT"
+        jq -r '.["err-data"] // ""' < "$QGA_EXEC_OUT" >&2
+
+        return "$(jq .exitcode < "$QGA_EXEC_OUT")"
+    elif [ -n "$(jq .pid < "$QGA_EXEC_OUT")" ]; then
+        return 254
+    fi
 }
 
 sed -n '/^pbs:/,/^\S/ p' /etc/pve/storage.cfg | while read -r KEY VALUE; do
@@ -87,7 +105,6 @@ if [ -z "$DRIVE" ]; then
     fi
 fi
 QMP="/run/qemu-server/${VMID}.qmp"
-QGA="/run/qemu-server/${VMID}.qga"
 
 echo "Locking VM"
 qm set "$VMID" -lock rollback
@@ -120,38 +137,47 @@ socat - "UNIX:${QMP}" <<EOF | { ! grep -F '"error"'; }
     }
 }
 EOF
-if [ -S "$QGA" ]; then
+MOUNTED=false
+TRIED_TO_MOUNT=false
+if ! [ -f "$MOUNT_BACKUP_SCRIPT" ]; then
+    echo "Could not find mount script under ${MOUNT_BACKUP_SCRIPT}"
+elif qm guest cmd "$VMID" ping; then
+    echo
+    read -r -p "Where should the backup be mounted to? [${DEFAULT_TARGET}] " TARGET
+    echo
+    : "${TARGET:=$DEFAULT_TARGET}"
+
+    read -r -p "How much RAM should be allocated to buffer writes to mounted backup? [${DEFAULT_RAMSIZE}] " RAMSIZE
+    echo
+    : "${RAMSIZE:=$DEFAULT_RAMSIZE}"
+
     echo "Mounting backup in VM..."
     sleep 2
-    PROC_ID="$(
-        {
-            echo '{ "execute": "guest-exec", "arguments": {"path": "/usr/local/sbin/pbs-mount-backup.sh", "arg": ["mount"], "env": ["QEMU_AGENT=1"], "capture-output": true} }'
-            sleep 0.5
-        } | socat - "UNIX:${QGA}" | jq 'select(.return).return.pid')"
-    sleep 1
-    if [ -n "$PROC_ID" ]; then
-        {
-            echo '{ "execute": "guest-exec-status", "arguments": {"pid": '"$PROC_ID"'}}'
-            sleep 0.5
-        } | socat - "UNIX:${QGA}" | jq -r 'select(.return).return["out-data"]' | base64 -d || true
+
+    QGA_EXEC_OUT="$(mktemp)"
+    TRIED_TO_MOUNT=true
+    if guest_exec sh -s -- mount -d "/dev/disk/by-id/virtio-${QEMU_DEVICE_SERIAL}" -t "$TARGET" -r "$RAMSIZE" < "$MOUNT_BACKUP_SCRIPT"; then
+        MOUNTED=true
+    else
+        echo "Failed to mount backup in VM (exitcode $?). See above output for details."
     fi
 fi
 read -r -s -p "Snapshot attached. Press return when done..."
 echo
-if [ -S "$QGA" ] && [ -n "$PROC_ID" ]; then
+if $TRIED_TO_MOUNT && ! $MOUNTED; then
+    read -r -p "Do you want to try unmounting, even though mounting didn't succeed? [n] " TRY_UMOUNT
+    case "$TRY_UMOUNT" in
+        [yY]*)
+            MOUNTED=true
+            ;;
+    esac
+fi
+if $MOUNTED; then
     echo "Unmounting backup in VM..."
-    PROC_ID="$(
-        {
-            echo '{ "execute": "guest-exec", "arguments": {"path": "/usr/local/sbin/pbs-mount-backup.sh", "arg": ["umount"], "capture-output": true} }'
-            sleep 0.5
-        } | socat - "UNIX:${QGA}" | jq .pid
-    )"
-    sleep 2
-    if [ -n "$PROC_ID" ]; then
-        {
-            echo '{ "execute": "guest-exec-status", "arguments": {"pid": '"$PROC_ID"'}}'
-            sleep 0.5
-        } | socat - "UNIX:${QGA}" > /dev/null
+    QGA_EXEC_OUT="$(mktemp)"
+    if ! guest_exec sh -s -- umount < "$MOUNT_BACKUP_SCRIPT"; then
+        read -r -s -p "Unmounting backup in VM failed! Press enter to continue with detaching the snapshot..."
+        echo
     fi
 fi
 echo "Detaching snapshot from VM"

@@ -1,12 +1,17 @@
 # Attach Proxmox Backup Server backups
 
-These scripts allow to attach backups from a Proxmox Backup Server to a running
-VM as additional disks (`pbs-attach-backup.sh`, to be run on the Proxmox Virtual
-Environment hypervisor) and mount them inside the VM with a RAM-backed write
-buffer (`pbs-mount-backup.sh`).
+These scripts allow to attach backups from a [Proxmox Backup Server] to a
+running VM as additional disks (`pbs-attach-backup.sh`, to be run on the
+[Proxmox Virtual Environment] hypervisor) and mount them inside the VM with a
+RAM-backed write buffer (`pbs-mount-backup.sh`).
 
-If the QEMU Guest Agent is installed, the mounting (and unmounting) is triggered
-automatically from the hypervisor.
+If the QEMU Guest Agent is installed (and enabled), the mounting (and
+unmounting) is triggered automatically from the hypervisor. For that to work,
+the `pbs-mount-backup.sh` has to be put in the same directory as
+`pbs-attach-backup.sh`.
+
+[Proxmox Backup Server]: https://pbs.proxmox.com/
+[Proxmox Virtual Environment]: https://pve.proxmox.com/
 
 ## Purpose
 
@@ -64,6 +69,11 @@ Locking VM
 update VM 174: -lock rollback
 Attaching drive drive-scsi0.img.fidx from snapshot vm/174/2022-10-24T01:08:19Z
 to VM 174
+
+Where should the backup be mounted to? [/mnt/backup]
+
+How much RAM should be allocated to buffer writes to mounted backup? [128]
+
 Mounting backup in VM...
 Mounted /dev/mapper/mounted_backup6 (assumed backup of /dev/sda6 mounted on /) to /mnt/backup/.
 Mounted /dev/mapper/mounted_backup5 (assumed backup of /dev/sda5 mounted on /var/tmp) to /mnt/backup/var/tmp.

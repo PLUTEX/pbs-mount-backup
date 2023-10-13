@@ -88,15 +88,23 @@ if [ "$MODE" = mount ]; then
     done
 
     if [ -z "${QEMU_AGENT:-}" ]; then
-        echo ""
-        echo "After usage, please execute '$(basename "$0") umount' (inside VM)"
+        case "$-" in
+            *s*)
+                # script was passed via stdin, so we probably got called via
+                # QEMU guest agent
+                ;;
+            *)
+                echo ""
+                echo "After usage, please execute '$(basename "$0") umount' (inside VM)"
+                ;;
+        esac
     fi
 elif [ "$MODE" = "umount" ]; then
     if ! [ -b "$DMPATH" ]; then
         echo "DM device not found. Did you mount a backup?" >&2
         exit 1
     fi
-    awk "\$2 ~ \"^${TARGET%/}\" { print \$2 }" /proc/mounts | sort -r | xargs umount
-    dmsetup ls | grep "^${DMNAME}" | cut -f1 | xargs dmsetup remove
+    awk "\$2 ~ \"^${TARGET%/}\" { print \$2 }" /proc/mounts | sort -r | xargs -r umount
+    dmsetup ls | grep "^${DMNAME}" | cut -f1 | tac | xargs dmsetup remove
     rmmod brd
 fi
