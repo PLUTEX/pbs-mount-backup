@@ -6,6 +6,10 @@ shopt -s lastpipe
 
 declare -A PBS_CONFIG=()
 
+QEMU_DRIVE_NAME="mounted_backup"
+QEMU_DEVICE_NAME="$QEMU_DRIVE_NAME"
+QEMU_DEVICE_SERIAL="$QEMU_DRIVE_NAME"
+
 debug() {
     if [ -n "${DEBUG:-}" ]; then
         echo "$*"
@@ -96,7 +100,7 @@ socat - "UNIX:${QMP}" <<EOF | { ! grep -F '"error"'; }
     "execute": "blockdev-add",
     "arguments": {
         "driver": "pbs",
-        "node-name": "mounted_backup",
+        "node-name": "${QEMU_DRIVE_NAME}",
         "read-only": true,
         "repository": "${PBS_CONFIG[username]}@${PBS_CONFIG[server]}:${PBS_CONFIG[datastore]}",
         "namespace": "${PBS_CONFIG[namespace]:-}",
@@ -110,9 +114,9 @@ socat - "UNIX:${QMP}" <<EOF | { ! grep -F '"error"'; }
     "execute": "device_add",
     "arguments": {
         "driver": "virtio-blk-pci",
-        "id": "mounted_backup",
-        "drive": "mounted_backup",
-        "serial": "mounted_backup"
+        "id": "${QEMU_DEVICE_NAME}",
+        "drive": "${QEMU_DRIVE_NAME}",
+        "serial": "${QEMU_DEVICE_SERIAL}"
     }
 }
 EOF
@@ -154,9 +158,9 @@ echo "Detaching snapshot from VM"
 # shellcheck disable=SC2251
 {
     echo '{ "execute": "qmp_capabilities" }'
-    echo '{ "execute": "device_del", "arguments": { "id": "mounted_backup" } }'
+    echo '{ "execute": "device_del", "arguments": { "id": "'"$QEMU_DEVICE_NAME"'" } }'
     sleep 2
-    echo '{ "execute": "blockdev-del", "arguments": { "node-name": "mounted_backup" } }'
+    echo '{ "execute": "blockdev-del", "arguments": { "node-name": "'"$QEMU_DRIVE_NAME"'" } }'
 } | socat - "UNIX:/var/run/qemu-server/${VMID}.qmp" | { ! grep -F '"error"'; }
 echo "Unlocking VM"
 qm unlock "$VMID"
