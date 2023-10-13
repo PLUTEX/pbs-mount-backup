@@ -79,30 +79,44 @@ fi
 
 if [ -z "$SNAPSHOT" ]; then
     pvesh get "/nodes/localhost/storage/${PVE_STORAGE}/content" --content backup --vmid "$VMID" --output-format=json | jq -r ".[].volid | ltrimstr(\"${PVE_STORAGE}:backup/\")" | readarray -t -O 1 SNAPSHOTS
-    if [ "${#SNAPSHOTS[@]}" = 1 ]; then
-        SNAPSHOT="${SNAPSHOTS[1]}"
-    else
-        for i in "${!SNAPSHOTS[@]}"; do
-            echo "${i}) ${SNAPSHOTS[i]}"
-        done
-        read -r -p "Choose snapshot: " SNAPSHOT_ID
-        echo
-        SNAPSHOT="${SNAPSHOTS[$SNAPSHOT_ID]}"
-    fi
+    case "${#SNAPSHOTS[@]}" in
+        0)
+            echo "Did not find any snapshots for VM ${VMID}!"
+            exit 1
+            ;;
+        1)
+            SNAPSHOT="${SNAPSHOTS[1]}"
+            ;;
+        *)
+            for i in "${!SNAPSHOTS[@]}"; do
+                echo "${i}) ${SNAPSHOTS[i]}"
+            done
+            read -r -p "Choose snapshot: " SNAPSHOT_ID
+            echo
+            SNAPSHOT="${SNAPSHOTS[$SNAPSHOT_ID]}"
+            ;;
+    esac
 fi
 
 if [ -z "$DRIVE" ]; then
     pvesh get "/nodes/localhost/storage/${PVE_STORAGE}/file-restore/list" --volume "$SNAPSHOT" --filepath / --output-format=json | jq -r '.[].text' | readarray -t -O 1 DRIVES
-    if [ "${#DRIVES[@]}" = 1 ]; then
-        DRIVE="${DRIVES[1]}"
-    else
-        for i in "${!DRIVES[@]}"; do
-            echo "${i}) ${DRIVES[i]}"
-        done
-        read -r -p "Choose drive: " DRIVE_ID
-        echo
-        DRIVE="${DRIVES[$DRIVE_ID]}"
-    fi
+    case "${#DRIVES[@]}" in
+        0)
+            echo "The snapshot ${SNAPSHOT} of VM ${VMID} does not contain any drives!"
+            exit 1
+            ;;
+        1)
+            DRIVE="${DRIVES[1]}"
+            ;;
+        *)
+            for i in "${!DRIVES[@]}"; do
+                echo "${i}) ${DRIVES[i]}"
+            done
+            read -r -p "Choose drive: " DRIVE_ID
+            echo
+            DRIVE="${DRIVES[$DRIVE_ID]}"
+            ;;
+    esac
 fi
 QMP="/run/qemu-server/${VMID}.qmp"
 
