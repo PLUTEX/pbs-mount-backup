@@ -187,21 +187,31 @@ if $TRIED_TO_MOUNT && ! $MOUNTED; then
     esac
 fi
 if $MOUNTED; then
-    echo "Unmounting backup in VM..."
-    QGA_EXEC_OUT="$(mktemp)"
-    if ! guest_exec sh -s -- umount < "$MOUNT_BACKUP_SCRIPT"; then
-        read -r -s -p "Unmounting backup in VM failed! Press enter to continue with detaching the snapshot..."
-        echo
+    if qm guest cmd "$VMID" ping; then
+        echo "Unmounting backup in VM..."
+        QGA_EXEC_OUT="$(mktemp)"
+        if ! guest_exec sh -s -- umount < "$MOUNT_BACKUP_SCRIPT"; then
+            echo "Unmounting backup in VM failed!"
+            read -r -s -p "Press enter to continue detaching without unmounting the snapshot..."
+            echo
+        fi
+    else
+        echo "QEMU Guest Agent not responding, skipping unmount of backup in VM"
     fi
 fi
-echo "Detaching snapshot from VM"
-# shellcheck disable=SC2251
-{
-    echo '{ "execute": "qmp_capabilities" }'
-    echo '{ "execute": "device_del", "arguments": { "id": "'"$QEMU_DEVICE_NAME"'" } }'
-    sleep 2
-    echo '{ "execute": "blockdev-del", "arguments": { "node-name": "'"$QEMU_DRIVE_NAME"'" } }'
-} | socat - "UNIX:/var/run/qemu-server/${VMID}.qmp" | { ! grep -F '"error"'; }
+if [ -S "$QMP" ]; then
+    echo "Detaching snapshot from VM"
+    # shellcheck disable=SC2251
+    {
+        echo '{ "execute": "qmp_capabilities" }'
+        echo '{ "execute": "device_del", "arguments": { "id": "'"$QEMU_DEVICE_NAME"'" } }'
+        sleep 2
+        echo '{ "execute": "blockdev-del", "arguments": { "node-name": "'"$QEMU_DRIVE_NAME"'" } }'
+    } | socat - "UNIX:${QMP}" | { ! grep -F '"error"'; }
+else
+    echo "Management socket disappeared. Maybe the VM is shut down?"
+    echo "Skipping detaching the snapshot from the VM."
+fi
 echo "Unlocking VM"
 qm unlock "$VMID"
 
