@@ -71,7 +71,7 @@ SNAPSHOT="${2:-}"
 DRIVE="${3:-}"
 
 if [ "$VMID" = 0 ]; then
-    qm list
+    qm list | awk '$3 == "running" || NR == 1' | column -t
     echo
     read -r -p "Enter VMID to restore: " VMID
     echo
