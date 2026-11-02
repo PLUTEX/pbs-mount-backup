@@ -39,7 +39,7 @@ guest_exec() {
     fi
 }
 
-sed -n '/^pbs:/,/^\S/ p' /etc/pve/storage.cfg | while read -r KEY VALUE; do
+sed -n '/^pbs:/,/^\S/{ /^\S/!p; /^pbs:/p; }' /etc/pve/storage.cfg | while read -r KEY VALUE; do
     case "$KEY" in
         "")
             ;;
@@ -54,14 +54,13 @@ sed -n '/^pbs:/,/^\S/ p' /etc/pve/storage.cfg | while read -r KEY VALUE; do
             ;;
     esac
 done
-read -r 'PBS_CONFIG[password]' < "/etc/pve/priv/storage/${PVE_STORAGE}.pw"
-
-if [ -z "$PVE_STORAGE" ]; then
+if [ -z "${PVE_STORAGE:-}" ]; then
     error "No PBS storage found in PVE!"
 fi
+read -r 'PBS_CONFIG[password]' < "/etc/pve/priv/storage/${PVE_STORAGE}.pw"
 
 for KEY in username server datastore fingerprint password; do
-    if [ -z "${PBS_CONFIG[$KEY]}" ]; then
+    if [ -z "${PBS_CONFIG[$KEY]:-}" ]; then
         error "PBS option ${KEY} not found in storage config!"
     fi
 done
@@ -120,8 +119,114 @@ if [ -z "$DRIVE" ]; then
 fi
 QMP="/run/qemu-server/${VMID}.qmp"
 
+qmp_send() {
+    # Schickt die QMP-Befehle von der Standardeingabe und gibt die Antworten aus.
+    {
+        echo '{ "execute": "qmp_capabilities" }'
+        cat
+        sleep 1
+    } | socat - "UNIX:${QMP}"
+}
+
+detach() {
+    {
+        echo '{ "execute": "device_del", "arguments": { "id": "'"$QEMU_DEVICE_NAME"'" } }'
+        sleep 2
+        echo '{ "execute": "blockdev-del", "arguments": { "node-name": "'"$QEMU_DRIVE_NAME"'" } }'
+    } | qmp_send
+}
+
+LOCKED=false
+ATTACHED=false
+
+# Ohne diesen Trap bleibt die VM nach jedem Abbruch gesperrt zurueck, und
+# solange sie gesperrt ist, laeuft fuer sie weder Sicherung noch Migration.
+cleanup() {
+    local RC=$?
+    trap - EXIT
+    if $ATTACHED; then
+        if [ -S "$QMP" ]; then
+            echo "Detaching snapshot from VM"
+            # shellcheck disable=SC2251
+            detach | { ! grep -F '"error"'; } || echo "Detaching the snapshot failed, see above."
+        else
+            echo "Management socket disappeared. Maybe the VM is shut down?"
+            echo "Skipping detaching the snapshot from the VM."
+        fi
+    fi
+    if $LOCKED; then
+        echo "Unlocking VM"
+        qm unlock "$VMID" || true
+    fi
+    exit "$RC"
+}
+trap cleanup EXIT
+
+# Ein frueherer Lauf kann den Blockknoten hinterlassen haben: bricht das Skript
+# ab oder ist die VM beim Aufraeumen schon aus, bleibt er im laufenden QEMU
+# stehen, und blockdev-add scheitert mit "Duplicate nodes with node-name".
+if echo '{ "execute": "query-named-block-nodes" }' | qmp_send \
+        | jq -e --arg n "$QEMU_DRIVE_NAME" \
+            'select(has("return")) | any(.return[]; ."node-name" == $n)' > /dev/null 2>&1; then
+    echo "Removing leftover node ${QEMU_DRIVE_NAME} from an earlier run"
+    detach > /dev/null
+fi
+
+# Where to attach the disk. Hanging it off the SCSI controller the VM already
+# has costs no PCI slot at all and works on i440fx and q35 alike. Only if there
+# is none, fall back to virtio-blk-pci - and then pin the address, because
+# letting QEMU choose fails once the root bus is occupied: "slot 31 function 0
+# already occupied by pci-bridge, new func virtio-blk-pci cannot be exposed to
+# guest".
+PCI_TOPOLOGY="$(echo '{ "execute": "query-pci" }' | qmp_send)"
+
+SCSI_BUS=""
+echo "$PCI_TOPOLOGY" | jq -r '
+    select(has("return"))
+    | [ .. | objects
+        | select(has("qdev_id") and ((.class_info?.desc? // "") | test("SCSI")))
+        | .qdev_id ]
+    | map(select(. != null and . != "")) | first // empty
+' | head -n 1 | read -r SCSI_BUS || true
+
+if [ -n "$SCSI_BUS" ]; then
+    DEVICE_DRIVER="scsi-hd"
+    GUEST_DISK="/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_${QEMU_DEVICE_SERIAL}"
+    PLACEMENT=",
+        \"bus\": \"${SCSI_BUS}.0\""
+    echo "Attaching to SCSI controller ${SCSI_BUS}"
+else
+    DEVICE_DRIVER="virtio-blk-pci"
+    GUEST_DISK="$GUEST_DISK"
+    PCI_BUS=""
+    PCI_SLOT=""
+    # Only legacy pci-bridges take a device on an arbitrary slot; a PCIe root
+    # port takes exactly one, on slot 0. Count down, because PVE puts its own
+    # devices on the low slots.
+    echo "$PCI_TOPOLOGY" | jq -r '
+        select(has("return")) | .return[].devices[]
+        | select(.pci_bridge != null and ((.qdev_id // "") | startswith("pci.")))
+        | . as $bridge
+        | ([range(1;32)] - [$bridge.pci_bridge.devices[]?.slot]) as $free
+        | select(($free | length) > 0)
+        | "\($bridge.qdev_id) \($free | last)"
+    ' | head -n 1 | read -r PCI_BUS PCI_SLOT || true
+
+    if [ -n "$PCI_BUS" ]; then
+        PLACEMENT=",
+        \"bus\": \"${PCI_BUS}\",
+        \"addr\": \"$(printf '0x%x' "$PCI_SLOT")\""
+        echo "No SCSI controller, attaching to ${PCI_BUS} slot $(printf '0x%x' "$PCI_SLOT")"
+    else
+        PLACEMENT=""
+        echo "No SCSI controller and no PCI bridge with a free slot found;"
+        echo "letting QEMU choose the address. This may fail on a full root bus."
+    fi
+fi
+
 echo "Locking VM"
 qm set "$VMID" -lock rollback
+LOCKED=true
 echo "Attaching drive ${DRIVE} from snapshot ${SNAPSHOT} to VM ${VMID}"
 
 # shellcheck disable=SC2251
@@ -144,13 +249,14 @@ socat - "UNIX:${QMP}" <<EOF | { ! grep -F '"error"'; }
 {
     "execute": "device_add",
     "arguments": {
-        "driver": "virtio-blk-pci",
+        "driver": "${DEVICE_DRIVER}",
         "id": "${QEMU_DEVICE_NAME}",
         "drive": "${QEMU_DRIVE_NAME}",
-        "serial": "${QEMU_DEVICE_SERIAL}"
+        "serial": "${QEMU_DEVICE_SERIAL}"${PLACEMENT}
     }
 }
 EOF
+ATTACHED=true
 MOUNTED=false
 TRIED_TO_MOUNT=false
 if ! [ -f "$MOUNT_BACKUP_SCRIPT" ]; then
@@ -170,7 +276,7 @@ elif qm guest cmd "$VMID" ping; then
 
     QGA_EXEC_OUT="$(mktemp)"
     TRIED_TO_MOUNT=true
-    if guest_exec sh -s -- mount -d "/dev/disk/by-id/virtio-${QEMU_DEVICE_SERIAL}" -t "$TARGET" -r "$RAMSIZE" < "$MOUNT_BACKUP_SCRIPT"; then
+    if guest_exec sh -s -- mount -d "$GUEST_DISK" -t "$TARGET" -r "$RAMSIZE" < "$MOUNT_BACKUP_SCRIPT"; then
         MOUNTED=true
     else
         echo "Failed to mount backup in VM (exitcode $?). See above output for details."
@@ -199,20 +305,4 @@ if $MOUNTED; then
         echo "QEMU Guest Agent not responding, skipping unmount of backup in VM"
     fi
 fi
-if [ -S "$QMP" ]; then
-    echo "Detaching snapshot from VM"
-    # shellcheck disable=SC2251
-    {
-        echo '{ "execute": "qmp_capabilities" }'
-        echo '{ "execute": "device_del", "arguments": { "id": "'"$QEMU_DEVICE_NAME"'" } }'
-        sleep 2
-        echo '{ "execute": "blockdev-del", "arguments": { "node-name": "'"$QEMU_DRIVE_NAME"'" } }'
-    } | socat - "UNIX:${QMP}" | { ! grep -F '"error"'; }
-else
-    echo "Management socket disappeared. Maybe the VM is shut down?"
-    echo "Skipping detaching the snapshot from the VM."
-fi
-echo "Unlocking VM"
-qm unlock "$VMID"
-
 exit 0
